@@ -1,15 +1,28 @@
 use std::ffi::CString;
 use std::slice::SliceIndex;
 use std::ops::{Deref, DerefMut};
+use std::marker::PhantomData;
 use libc;
 
 #[repr(transparent)]
-pub struct LiquidVecRef<'alloc> { alloc: &'alloc mut BumpAlloc }
+pub struct LiquidVecRef<'alloc, 'data> {
+    alloc: &'alloc mut BumpAlloc,
+    _data: PhantomData<&'data()>,
+}
 
-impl <'alloc> LiquidVecRef<'alloc> {
+impl <'alloc, 'data> LiquidVecRef<'alloc, 'data> {
+    /// ```compile_fail
+    /// use Freeze::{BumpAllocRef, LiquidVecRef};
+    /// let mut alloc = BumpAllocRef::new();
+    /// let mut v1 = alloc.top();
+    /// v1.extend_from_slice(&[42]);
+    /// let slice = v1.freeze();
+    /// drop(alloc);
+    /// assert!(slice[0] == 42); // borrowing alloc after freezing
+    /// ```
     /// Consume the vector and produce a slice that can still be used; it's length is now fixed
     #[inline(always)]
-    pub fn freeze(self) -> &'alloc mut [u8] {
+    pub fn freeze(self) -> &'data mut [u8] {
         unsafe {
             let ret = std::ptr::slice_from_raw_parts_mut(self.alloc.top_base, self.alloc.top_size);
 
@@ -76,7 +89,7 @@ impl <'alloc> LiquidVecRef<'alloc> {
     }
 }
 
-impl <'alloc> std::borrow::Borrow<[u8]> for LiquidVecRef<'alloc> {
+impl <'alloc, 'data> std::borrow::Borrow<[u8]> for LiquidVecRef<'alloc, 'data> {
     #[inline(always)]
     fn borrow(&self) -> &[u8] {
         unsafe {
@@ -85,7 +98,7 @@ impl <'alloc> std::borrow::Borrow<[u8]> for LiquidVecRef<'alloc> {
     }
 }
 
-impl <'alloc> std::borrow::BorrowMut<[u8]> for LiquidVecRef<'alloc> {
+impl <'alloc, 'data> std::borrow::BorrowMut<[u8]> for LiquidVecRef<'alloc, 'data> {
     #[inline(always)]
     fn borrow_mut(&mut self) -> &mut [u8] {
         unsafe {
@@ -94,25 +107,25 @@ impl <'alloc> std::borrow::BorrowMut<[u8]> for LiquidVecRef<'alloc> {
     }
 }
 
-impl <'alloc> Extend<u8> for LiquidVecRef<'alloc>  {
+impl <'alloc, 'data> Extend<u8> for LiquidVecRef<'alloc, 'data>  {
     #[inline(always)]
     fn extend<T: IntoIterator<Item=u8>>(&mut self, iter: T) {
         iter.into_iter().for_each(|b| self.extend_one(b))
     }
 }
 
-impl <'alloc, I: SliceIndex<[u8]>> std::ops::Index<I> for LiquidVecRef<'alloc>  {
+impl <'alloc, 'data, I: SliceIndex<[u8]>> std::ops::Index<I> for LiquidVecRef<'alloc, 'data>  {
     type Output = I::Output;
     #[inline(always)]
     fn index(&self, index: I) -> &Self::Output { std::ops::Index::index(self.deref(), index) }
 }
 
-impl <'alloc, I: SliceIndex<[u8]>> std::ops::IndexMut<I> for LiquidVecRef<'alloc>  {
+impl <'alloc, 'data, I: SliceIndex<[u8]>> std::ops::IndexMut<I> for LiquidVecRef<'alloc, 'data>  {
     #[inline(always)]
     fn index_mut(&mut self, index: I) -> &mut Self::Output { std::ops::IndexMut::index_mut(self.deref_mut(), index) }
 }
 
-impl <'alloc> std::ops::Deref for LiquidVecRef<'alloc> {
+impl <'alloc, 'data> std::ops::Deref for LiquidVecRef<'alloc, 'data> {
     type Target = [u8];
 
     #[inline(always)]
@@ -123,7 +136,7 @@ impl <'alloc> std::ops::Deref for LiquidVecRef<'alloc> {
     }
 }
 
-impl <'alloc> std::ops::DerefMut for LiquidVecRef<'alloc> {
+impl <'alloc, 'data> std::ops::DerefMut for LiquidVecRef<'alloc, 'data> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe {
@@ -140,11 +153,12 @@ struct BumpAlloc {
 }
 
 #[repr(transparent)]
-pub struct BumpAllocRef {
-    ptr: *mut BumpAlloc
+pub struct BumpAllocRef<'data> {
+    ptr: *mut BumpAlloc,
+    _data: PhantomData<&'data ()>,
 }
 
-impl BumpAllocRef {
+impl<'data> BumpAllocRef<'data> {
     /// New Bump allocator with at most ~4GB of stuff in it
     pub fn new() -> Self {
         Self::new_with_address_space(32)
@@ -154,9 +168,10 @@ impl BumpAllocRef {
     pub fn new_with_address_space(bits: u8) -> Self {
         use libc::*;
         unsafe {
-            let res = mmap(std::ptr::null_mut(), 1 << bits, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            //let res = mmap(std::ptr::null_mut(), 1 << bits, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            let res = mmap(std::ptr::null_mut(), 1 << bits, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if res as i64 == -1 {
-                let cstring = strerror(*__errno_location());
+                let cstring = todo!();// strerror(*__errno_location());
                 panic!("{:?}", CString::from_raw(cstring));
                 // Err(std::str::from_utf8_unchecked(std::slice::from_raw_parts_mut(cstring, strlen(cstring)));
             }
@@ -169,33 +184,42 @@ impl BumpAllocRef {
                 top_size: 0,
             };
 
-            Self { ptr: res as *mut BumpAlloc }
+            Self { ptr: res as *mut BumpAlloc, _data: PhantomData }
         }
     }
 
+    /// ```compile_fail
+    /// let mut alloc = BumpAllocRef::new();
+    /// let mut v1 = alloc.top();
+    /// let mut v2 = alloc.top();
+    /// v1.extend_one(1); // borrowing alloc twice
+    /// v2.extend_one(2);
+    /// ```
     /// Gets the (custom) Vec ref that's currently able to be modified
-    pub fn top(&self) -> LiquidVecRef {
+    pub fn top<'alloc>(&'alloc mut self) -> LiquidVecRef<'alloc, 'data> {
         unsafe {
             LiquidVecRef {
-                alloc: self.ptr.as_mut().unwrap_unchecked()
+                alloc: self.ptr.as_mut().unwrap_unchecked(),
+                _data: PhantomData,
             }
         }
     }
 
     unsafe fn data_range(&self) -> &[u8] {
         let data_base = self.ptr.byte_add(size_of::<BumpAlloc>()) as *mut u8;
-        std::slice::from_raw_parts(data_base, ((*self.ptr).top_base as usize - data_base as usize) + (*self.ptr).top_size)
+        std::slice::from_raw_parts(data_base, self.data_size())
     }
 
     unsafe fn data_range_mut(&mut self) -> &mut [u8] {
         let data_base = self.ptr.byte_add(size_of::<BumpAlloc>()) as *mut u8;
-        std::slice::from_raw_parts_mut(data_base, ((*self.ptr).top_base as usize - data_base as usize) + (*self.ptr).top_size)
+        std::slice::from_raw_parts_mut(data_base, self.data_size())
     }
 
     /// The total number of data bytes allocated over the lifetime of the allocator
     pub fn data_size(&self) -> usize {
         unsafe {
-            self.data_range().len()
+            let data_base = self.ptr.byte_add(size_of::<BumpAlloc>()) as *mut u8;
+            ((*self.ptr).top_base as usize - data_base as usize) + (*self.ptr).top_size
         }
     }
 
@@ -207,7 +231,7 @@ impl BumpAllocRef {
     }
 }
 
-impl Drop for BumpAllocRef {
+impl<'data> Drop for BumpAllocRef<'data> {
     fn drop(&mut self) {
         unsafe {
             libc::munmap(self.ptr as _, (*self.ptr).address_space);
@@ -223,8 +247,8 @@ mod tests {
     fn basis() {
         let mut alloc = BumpAllocRef::new();
 
-        let s1: &[u8] = {
-            let mut v1: LiquidVecRef = alloc.top();
+        let s1: &mut [u8] = {
+            let mut v1 = alloc.top();
             v1.extend_from_slice(&[1, 2, 3]);
             v1.extend_one(4);
             v1.extend_from_within(..3);
@@ -235,8 +259,8 @@ mod tests {
 
         assert_eq!(s1, [3, 2, 1, 4, 3, 2]);
 
-        let s2: &[u8] = {
-            let mut v1: LiquidVecRef = alloc.top();
+        let s2: &mut [u8] = {
+            let mut v1 = alloc.top();
             v1.extend_from_slice(&[10, 20, 30]);
             v1.extend_one(40);
             v1.extend_from_within(..3);
