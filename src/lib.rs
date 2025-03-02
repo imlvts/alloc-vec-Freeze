@@ -12,13 +12,14 @@ pub struct LiquidVecRef<'alloc, 'data> {
 
 impl <'alloc, 'data> LiquidVecRef<'alloc, 'data> {
     /// ```compile_fail
-    /// use Freeze::{BumpAllocRef, LiquidVecRef};
-    /// let mut alloc = BumpAllocRef::new();
+    /// use Freeze::{BumpAlloc};
+    /// let mut allocb = BumpAlloc::new();
+    /// let mut alloc = allocb.to_ref();
     /// let mut v1 = alloc.top();
     /// v1.extend_from_slice(&[42]);
     /// let slice = v1.freeze();
-    /// drop(alloc);
-    /// assert!(slice[0] == 42); // borrowing alloc after freezing
+    /// drop(allocb);
+    /// let _ = slice.len(); // should fail
     /// ```
     /// Consume the vector and produce a slice that can still be used; it's length is now fixed
     #[inline(always)]
@@ -146,19 +147,14 @@ impl <'alloc, 'data> std::ops::DerefMut for LiquidVecRef<'alloc, 'data> {
 }
 
 
-struct BumpAlloc {
+pub struct BumpAlloc {
     address_space: usize,
+    data_base: *mut u8,
     top_base: *mut u8,
     top_size: usize
 }
 
-#[repr(transparent)]
-pub struct BumpAllocRef<'data> {
-    ptr: *mut BumpAlloc,
-    _data: PhantomData<&'data ()>,
-}
-
-impl<'data> BumpAllocRef<'data> {
+impl BumpAlloc {
     /// New Bump allocator with at most ~4GB of stuff in it
     pub fn new() -> Self {
         Self::new_with_address_space(32)
@@ -178,22 +174,34 @@ impl<'data> BumpAllocRef<'data> {
             if res as i64 == 0 {
                 panic!("mmap returned nullptr")
             }
-            *(res as *mut BumpAlloc) = BumpAlloc {
+            BumpAlloc {
                 address_space: 1 << bits,
-                top_base: (res as *mut u8).byte_add(size_of::<BumpAlloc>()),
+                data_base: res as *mut u8,
+                top_base: res as *mut u8,
                 top_size: 0,
-            };
-
-            Self { ptr: res as *mut BumpAlloc, _data: PhantomData }
+            }
         }
     }
+    pub fn to_ref<'data>(&'data mut self) -> BumpAllocRef<'data> {
+        BumpAllocRef { ptr: self as *mut BumpAlloc, _data: PhantomData }
+    }
+}
 
+#[repr(transparent)]
+pub struct BumpAllocRef<'data> {
+    ptr: *mut BumpAlloc,
+    _data: PhantomData<&'data ()>,
+}
+
+impl<'data> BumpAllocRef<'data> {
     /// ```compile_fail
-    /// let mut alloc = BumpAllocRef::new();
+    /// use Freeze::{BumpAlloc};
+    /// let mut alloc = BumpAlloc::new();
+    /// let mut alloc = alloc.to_ref();
     /// let mut v1 = alloc.top();
     /// let mut v2 = alloc.top();
-    /// v1.extend_one(1); // borrowing alloc twice
-    /// v2.extend_one(2);
+    /// v1.extend_from_slice(&[1]); // borrowing alloc twice
+    /// v2.extend_from_slice(&[1]);
     /// ```
     /// Gets the (custom) Vec ref that's currently able to be modified
     pub fn top<'alloc>(&'alloc mut self) -> LiquidVecRef<'alloc, 'data> {
@@ -206,20 +214,20 @@ impl<'data> BumpAllocRef<'data> {
     }
 
     unsafe fn data_range(&self) -> &[u8] {
-        let data_base = self.ptr.byte_add(size_of::<BumpAlloc>()) as *mut u8;
+        let data_base = (*self.ptr).data_base;
         std::slice::from_raw_parts(data_base, self.data_size())
     }
 
     unsafe fn data_range_mut(&mut self) -> &mut [u8] {
-        let data_base = self.ptr.byte_add(size_of::<BumpAlloc>()) as *mut u8;
+        let data_base = (*self.ptr).data_base;
         std::slice::from_raw_parts_mut(data_base, self.data_size())
     }
 
     /// The total number of data bytes allocated over the lifetime of the allocator
     pub fn data_size(&self) -> usize {
         unsafe {
-            let data_base = self.ptr.byte_add(size_of::<BumpAlloc>()) as *mut u8;
-            ((*self.ptr).top_base as usize - data_base as usize) + (*self.ptr).top_size
+            (*self.ptr).top_base.offset_from((*self.ptr).data_base) as usize
+                + (*self.ptr).top_size
         }
     }
 
@@ -245,7 +253,8 @@ mod tests {
 
     #[test]
     fn basis() {
-        let mut alloc = BumpAllocRef::new();
+        let mut alloc = BumpAlloc::new();
+        let mut alloc = alloc.to_ref();
 
         let s1: &mut [u8] = {
             let mut v1 = alloc.top();
